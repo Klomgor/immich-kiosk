@@ -1,32 +1,92 @@
 {
   description = "immich-kiosk - Highly configurable slideshows for displaying Immich assets on browsers and devices.";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
-
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        version = "0.37.0"; # hard coded for now
+
+        # Step 1: install frontend deps
+        node_modules = pkgs.stdenv.mkDerivation {
+          pname = "immich-kiosk-node_modules";
+          inherit version;
+          nativeBuildInputs = [ pkgs.bun ];
+          phases = [ "buildPhase" "installPhase" ];
+
+          impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++
+            [ "GIT_PROXY_COMMAND" "SOCKS_SERVER" ];
+
+          buildPhase = ''
+            cp ${./frontend/package.json} package.json
+            cp ${./frontend/bun.lock} bun.lock
+            bun install --no-progress --frozen-lockfile
+          '';
+
+          installPhase = ''
+            mkdir -p $out
+            cp -R ./node_modules $out
+          '';
+
+          outputHash = "sha256-FNNWp3JtF4fGkWRRA0TolI97qBptmsOUNjbLuAmsZf0=";
+          outputHashAlgo = "sha256";
+          outputHashMode = "recursive";
+        };
+
+        # Step 2: build frontend assets
+        frontend = pkgs.stdenv.mkDerivation {
+          pname = "immich-kiosk-frontend";
+          inherit version;
+          src = ./frontend;
+          nativeBuildInputs = [ pkgs.bun pkgs.nodejs ];
+
+          configurePhase = ''
+            cp -R ${node_modules}/node_modules .
+          '';
+
+          buildPhase = ''
+            bun run css
+            bun run js
+            bun run url-builder
+          '';
+
+          installPhase = ''
+            mkdir -p $out
+            cp -r ./public/assets $out
+          '';
+        };
+
       in
       {
         packages = {
           default = self.packages.${system}.immich-kiosk;
 
-          immich-kiosk = pkgs.buildGoModule rec {
+          immich-kiosk = pkgs.buildGoModule {
             pname = "immich-kiosk";
-
+            inherit version;
             src = ./.;
+            vendorHash = "sha256-O1cH0EGHdOgpo+zhdlYFKVK4cOHg8ZKpsJezdKBv+K0=";
 
-            vendorHash = pkgs.lib.hashFile "sha256-";
+            nativeBuildInputs = with pkgs; [ go-task ];
 
-            nativeBuildInputs = with pkgs; [
-              go-task
+            preBuild = ''
+
+              # Satisfy go:embed frontend/public
+              mkdir -p frontend/public
+              cp -r ${frontend}/assets frontend/public/assets
+
+              # Generate templ templates
+              go tool templ generate
+            '';
+
+            ldflags = [
+              "-s" "-w"
+              "-X main.version=${version}"
             ];
 
-            # Ensure embedded assets are included
             subPackages = [ "." ];
 
             meta = with pkgs.lib; {
@@ -47,7 +107,6 @@
             golangci-lint
             bun
           ];
-
           shellHook = ''
             echo "immich-kiosk development environment"
             echo "Common commands:"
